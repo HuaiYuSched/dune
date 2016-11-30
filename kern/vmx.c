@@ -54,6 +54,7 @@
 
 #include <asm/desc.h>
 #include <asm/vmx.h>
+#include <asm/syscall.h>
 #include <asm/unistd_64.h>
 #include <asm/virtext.h>
 #include <asm/traps.h>
@@ -62,10 +63,14 @@
 #include "vmx.h"
 #include "compat.h"
 
+static bool __read_mostly vmm_exclusive = 1;
+module_param(vmm_exclusive, bool, S_IRUGO);
+
 static atomic_t vmx_enable_failed;
 
 static DECLARE_BITMAP(vmx_vpid_bitmap, VMX_NR_VPIDS);
 static DEFINE_SPINLOCK(vmx_vpid_lock);
+
 
 static unsigned long *msr_bitmap;
 
@@ -80,6 +85,7 @@ static DEFINE_PER_CPU(struct vmcs *, vmxarea);
 static DEFINE_PER_CPU(struct desc_ptr, host_gdt);
 static DEFINE_PER_CPU(int, vmx_enabled);
 DEFINE_PER_CPU(struct vmx_vcpu *, local_vcpu);
+
 
 static LIST_HEAD(vcpus);
 
@@ -633,27 +639,35 @@ static void __vmx_get_cpu_helper(void *ptr)
 static void vmx_get_cpu(struct vmx_vcpu *vcpu)
 {
 	int cur_cpu = get_cpu();
+	u64 phys_addr;
+	struct vmcs *vmxon_buf = this_cpu_read(vmxarea);
+	phys_addr = __pa(vmxon_buf);
+
+	if(!vmm_exclusive){
+		__vmxon(phys_addr);
+	}
 
 	if (__this_cpu_read(local_vcpu) != vcpu) {
 		this_cpu_write(local_vcpu, vcpu);
+	}
 
-		if (vcpu->cpu != cur_cpu) {
-			if (vcpu->cpu >= 0)
+	if (vcpu->cpu != cur_cpu) {
+		if (vcpu->cpu >= 0)
+			if(vmm_exclusive)
 				smp_call_function_single(vcpu->cpu,
 					__vmx_get_cpu_helper, (void *) vcpu, 1);
-			else
-				vmcs_clear(vcpu->vmcs);
+		else
+			vmcs_clear(vcpu->vmcs);
 
-			vpid_sync_context(vcpu->vpid);
-			ept_sync_context(vcpu->eptp);
+		vpid_sync_context(vcpu->vpid);
+		ept_sync_context(vcpu->eptp);
 
-			vcpu->launched = 0;
-			vmcs_load(vcpu->vmcs);
-			__vmx_setup_cpu();
-			vcpu->cpu = cur_cpu;
-		} else {
-			vmcs_load(vcpu->vmcs);
-		}
+		vcpu->launched = 0;
+		vmcs_load(vcpu->vmcs);
+		__vmx_setup_cpu();
+		vcpu->cpu = cur_cpu;
+	} else {
+		vmcs_load(vcpu->vmcs);
 	}
 }
 
@@ -663,6 +677,11 @@ static void vmx_get_cpu(struct vmx_vcpu *vcpu)
  */
 static void vmx_put_cpu(struct vmx_vcpu *vcpu)
 {
+	if(!vmm_exclusive) {
+		vmcs_clear(vcpu->vmcs);
+		vcpu->cpu = -1;
+		__vmxoff();
+	}
 	put_cpu();
 }
 
@@ -1670,8 +1689,10 @@ int vmx_launch(struct dune_config *conf, int64_t *ret_code)
 			if (vmx_handle_nmi_exception(vcpu))
 				done = 1;
 		} else if (ret != EXIT_REASON_EXTERNAL_INTERRUPT) {
+			vmx_get_cpu(vcpu);
 			printk(KERN_INFO "unhandled exit: reason %d, exit qualification %x\n",
 			       ret, vmcs_read32(EXIT_QUALIFICATION));
+			vmx_put_cpu(vcpu);
 			vcpu->ret_code = DUNE_RET_UNHANDLED_VMEXIT;
 			vmx_dump_cpu(vcpu);
 			done = 1;
@@ -1700,7 +1721,7 @@ static __init int __vmx_enable(struct vmcs *vmxon_buf)
 	u64 phys_addr = __pa(vmxon_buf);
 	u64 old, test_bits;
 
-	if (__read_cr4() & X86_CR4_VMXE)
+	if (vmm_exclusive && (__read_cr4() & X86_CR4_VMXE))
 		return -EBUSY;
 
 	rdmsrl(MSR_IA32_FEATURE_CONTROL, old);
@@ -1716,9 +1737,11 @@ static __init int __vmx_enable(struct vmcs *vmxon_buf)
 	}
 	cr4_set_bits(X86_CR4_VMXE);
 
-	__vmxon(phys_addr);
-	vpid_sync_vcpu_global();
-	ept_sync_global();
+	if(!vmm_exclusive){
+		__vmxon(phys_addr);
+		vpid_sync_vcpu_global();
+		ept_sync_global();
+	}
 
 	return 0;
 }
@@ -1755,8 +1778,10 @@ failed:
 static void vmx_disable(void *unused)
 {
 	if (__this_cpu_read(vmx_enabled)) {
-		__vmxoff();
-		cr4_clear_bits(X86_CR4_VMXE);
+		if(vmm_exclusive){
+			__vmxoff();
+			cr4_clear_bits(X86_CR4_VMXE);
+		}
 		this_cpu_write(vmx_enabled, 0);
 	}
 }
